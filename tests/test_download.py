@@ -1,7 +1,11 @@
 import pandas as pd
 import pytest
+import requests
 
 from jao_atc import download as dl
+
+# Most fixtures hold only a few MTUs; the completeness warning is tested on its own.
+pytestmark = pytest.mark.filterwarnings('ignore:IDCC.*MTU')
 
 ROWS = [
     {'dateTimeUtc': '2026-11-20T23:15:00Z', 'border_CZ_SK': 500, 'border_SK_CZ': -20, 'id': 2},
@@ -34,8 +38,9 @@ def test_fetch_run_parses_and_requests_local_day():
 
 
 def test_dst_day_is_25h():
-    s = FakeSession({'IDCCA_intradayAtc': ROWS})
-    dl.fetch_run('A', '2026-10-25', session=s)
+    s = FakeSession({})
+    with pytest.raises(dl.NotPublishedError):
+        dl.fetch_run('A', '2026-10-25', session=s)
     assert s.calls[0][1] == {'FromUtc': '2026-10-24T22:00:00.000Z', 'ToUtc': '2026-10-25T23:00:00.000Z'}
 
 
@@ -112,3 +117,77 @@ def test_tomorrow():
     today = pd.Timestamp.now(tz=dl.TZ).normalize()
     assert dl._delivery_day('tomorrow') == (today + pd.DateOffset(days=1)).normalize()
     assert dl._delivery_day('today') == today
+
+
+# --- robustness ---------------------------------------------------------------
+
+def _full_day(day, value=100, extra=()):
+    start = pd.Timestamp(day, tz=dl.TZ)
+    idx = dl._expected_mtus(start, start + pd.DateOffset(days=1))
+    return [{'dateTimeUtc': t.tz_convert('UTC').isoformat(), 'border_CZ_SK': value} for t in idx] + list(extra)
+
+
+@pytest.mark.parametrize('day,n', [('2026-11-21', 96), ('2026-03-29', 92), ('2026-10-25', 100)])
+def test_complete_day_has_no_warning(day, n, recwarn):
+    df = dl.fetch_run('A', day, session=FakeSession({'IDCCA_intradayAtc': _full_day(day)}))
+    assert len(df) == n
+    assert not [w for w in recwarn if 'missing' in str(w.message)]
+
+
+def test_missing_mtus_warn():
+    rows = _full_day('2026-11-21')[:-4]
+    with pytest.warns(UserWarning, match='4 MTU'):
+        dl.fetch_run('A', '2026-11-21', session=FakeSession({'IDCCA_intradayAtc': rows}))
+
+
+def test_rows_outside_day_and_duplicates_are_dropped():
+    other_day = {'dateTimeUtc': '2026-11-22T23:00:00Z', 'border_CZ_SK': 1}
+    dup = dict(_full_day('2026-11-21')[0], border_CZ_SK=999)
+    rows = _full_day('2026-11-21', extra=[other_day, dup])
+    df = dl.fetch_run('A', '2026-11-21', session=FakeSession({'IDCCA_intradayAtc': rows}))
+    assert len(df) == 96
+    assert df.index.is_unique
+    assert df['CZ>SK'].iloc[0] == 999                 # last duplicate wins
+
+
+def test_fetch_all_survives_http_error(monkeypatch):
+    class Flaky(FakeSession):
+        def get(self, url, params, timeout):
+            if 'IDCCE' in url:
+                raise requests.ConnectionError('timeout')
+            return super().get(url, params, timeout)
+    s = Flaky({'IDCCA_intradayAtc': ROWS})
+    monkeypatch.setattr(dl.requests, 'Session', lambda: s)
+    assert sorted(dl.fetch_all('2026-11-21', verbose=False)) == ['A']
+
+
+def test_latest_ignores_rows_outside_coverage():
+    dfs = {'B': dl._to_frame(_rows('00:00', '18:00', value=1), dl.TZ),
+           'E': dl._to_frame(_rows('00:00', '18:00', value=5), dl.TZ)}     # untrimmed E
+    out = dl.latest(dfs)
+    assert list(out['run']) == ['B', 'E']
+    assert list(out['CZ>SK']) == [1, 5]
+
+
+def test_latest_fills_gap_from_older_run_and_warns():
+    dfs = {'B': dl._to_frame(_rows('18:00', '18:15', '18:30', value=1), dl.TZ),
+           'E': dl._to_frame(_rows('18:00', '18:30', value=5), dl.TZ)}     # E misses 18:15
+    with pytest.warns(UserWarning, match='1 MTU'):
+        out = dl.latest(dfs)
+    assert list(out['run']) == ['E', 'B', 'E']
+    assert list(out['CZ>SK']) == [5, 1, 5]
+
+
+def test_latest_fills_missing_border_from_older_run_and_warns():
+    b = dl._to_frame(_rows('18:00', value=1), dl.TZ).assign(**{'SK>CZ': 7})
+    e = dl._to_frame(_rows('18:00', value=5), dl.TZ)                       # no SK>CZ column
+    with pytest.warns(UserWarning, match='SK>CZ'):
+        out = dl.latest({'B': b, 'E': e})
+    assert out.iloc[0]['CZ>SK'] == 5 and out.iloc[0]['SK>CZ'] == 7
+
+
+def test_save_load_latest(tmp_path):
+    dfs = {'B': dl._to_frame(_rows('00:00', value=1), dl.TZ)}
+    dl.save({'latest': dl.latest(dfs)}, '2026-11-21', tmp_path)
+    back = dl.load('latest', '2026-11-21', tmp_path)
+    assert list(back['run']) == ['B']

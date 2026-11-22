@@ -37,6 +37,7 @@ env/
 data/
 output/
 *.csv
+*.CSV
 *.xlsx
 *.parquet
 *.log

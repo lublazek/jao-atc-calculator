@@ -41,3 +41,27 @@ def test_never_below_direct_border():
     out = cap.all_pairs(pd.DataFrame([ATC]))
     for border, v in ATC.items():
         assert out.iloc[0][border] >= max(v, 0)
+
+
+def test_run_column_is_ignored():
+    df = pd.DataFrame([ATC]).assign(run='E')
+    assert cap.zones(df) == ['AT', 'CZ', 'HU', 'SK']
+    assert cap.all_pairs(df).iloc[0]['CZ>HU'] == 500
+    assert cap.max_flow(df.iloc[0], 'CZ', 'HU') == 500
+
+
+def test_unknown_zone_gives_clear_error():
+    with pytest.raises(ValueError, match='XX'):
+        cap.max_flow(ATC, 'CZ', 'XX')
+    with pytest.raises(ValueError, match='XX'):
+        cap.all_pairs(pd.DataFrame([ATC]), pairs=[('CZ', 'XX')])
+
+
+def test_hourly_is_min_of_quarter_hours_even_if_routes_change():
+    # Quarter 1 can only route via SK, quarter 2 only via AT: each still carries 100.
+    q1 = {'CZ>SK': 100, 'SK>HU': 100, 'CZ>AT': 0, 'AT>HU': 0}
+    q2 = {'CZ>SK': 0, 'SK>HU': 0, 'CZ>AT': 100, 'AT>HU': 100}
+    q3 = {'CZ>SK': 300, 'SK>HU': 300, 'CZ>AT': 0, 'AT>HU': 0}
+    idx = pd.date_range('2026-11-22', periods=4, freq='15min', tz='Europe/Luxembourg')
+    flow = cap.all_pairs(pd.DataFrame([q1, q2, q3, q3], index=idx), pairs=[('CZ', 'HU')])
+    assert cap.hourly(flow)['CZ>HU'].tolist() == [100]

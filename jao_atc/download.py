@@ -22,6 +22,7 @@ IDCC(d) at 10:00 for 12:00 onwards, IDCC(e) at 16:00 for 18:00 onwards.
 from __future__ import annotations
 
 import argparse
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -31,6 +32,7 @@ TZ = 'Europe/Luxembourg'
 BASE_URL = 'https://publicationtool.jao.eu/coreID/api/data'
 RUNS = ('A', 'B', 'C', 'D', 'E')
 TIMEOUT = 60
+MTU = pd.Timedelta(minutes=15)
 
 # When each run is calculated and from which MTU of delivery day D it applies
 # (local time). IDCC(a)/(b) are calculated on D-1 and cover the whole of D;
@@ -88,6 +90,12 @@ def coverage_start(run: str, day=None, tz: str = TZ) -> pd.Timestamp:
     return _delivery_day(day, tz).replace(hour=h, minute=m)
 
 
+def _expected_mtus(first: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
+    """All 15-min MTUs in [first, end), stepping in UTC so DST days get 92/100 MTUs."""
+    idx = pd.date_range(first.tz_convert('UTC'), end.tz_convert('UTC'), freq=MTU, inclusive='left')
+    return idx.tz_convert(first.tz)
+
+
 def fetch_run(run: str = 'D', day=None, tz: str = TZ, trim: bool = True,
               session: requests.Session | None = None) -> pd.DataFrame:
     """Fetch one IDCC run for one delivery day.
@@ -104,18 +112,28 @@ def fetch_run(run: str = 'D', day=None, tz: str = TZ, trim: bool = True,
         timeout=TIMEOUT,
     )
     r.raise_for_status()
-    rows = r.json().get('data', [])
-    df = _to_frame(rows, tz) if rows else pd.DataFrame()
-    if trim and not df.empty:
-        df = df[df.index >= coverage_start(run, start, tz)]
+    rows = r.json().get('data') or []
+    df = _to_frame(rows, tz) if rows else pd.DataFrame(index=pd.DatetimeIndex([], tz=tz))
+    first = coverage_start(run, start, tz) if trim else start
+    df = df[(df.index >= first) & (df.index < end)]
+    df = df[~df.index.duplicated(keep='last')]
     if df.empty:
         raise NotPublishedError(f'IDCC({run.lower()}) not published for {start.date()}')
+    missing = _expected_mtus(first, end).difference(df.index)
+    if len(missing):
+        warnings.warn(f'IDCC({run.lower()}) {start.date()}: {len(missing)} MTU(s) missing, '
+                      f'first {missing[0]:%H:%M}', stacklevel=2)
     return df
 
 
 def fetch_all(day=None, runs=RUNS, tz: str = TZ, trim: bool = True,
               verbose: bool = True) -> dict[str, pd.DataFrame]:
-    """Fetch several IDCC runs for one day. Runs without data are skipped."""
+    """Fetch several IDCC runs for one day.
+
+    Runs that are not published, or whose download fails, are skipped with a
+    message, so one bad run does not lose the others.
+    """
+    day = _delivery_day(day, tz)                # resolve once: no midnight mix-ups
     out: dict[str, pd.DataFrame] = {}
     with requests.Session() as s:
         for run in runs:
@@ -129,21 +147,50 @@ def fetch_all(day=None, runs=RUNS, tz: str = TZ, trim: bool = True,
             except NotPublishedError as e:
                 if verbose:
                     print(f'IDCC({run.lower()}): skipped - {e}')
+            except (requests.RequestException, ValueError) as e:
+                print(f'IDCC({run.lower()}): download failed - {e}')
     return out
 
 
 def latest(dfs: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Combine runs: for every MTU take the values of the newest run covering it.
 
-    Adds a ``run`` column saying which IDCC run each row comes from.
+    Rows outside a run's coverage are ignored. Where the newest run has no
+    value (missing MTU or border), the next older run fills in, with a warning.
+    Adds a ``run`` column saying which run each MTU comes from.
     """
+    dfs = {r: df for r, df in dfs.items() if not df.empty}
     if not dfs:
         raise NotPublishedError('No IDCC run available')
-    parts = []
-    for run in sorted(dfs):                       # A..E = oldest..newest
-        parts.append(dfs[run].assign(run=run))
-    combined = pd.concat(parts)
-    return combined[~combined.index.duplicated(keep='last')].sort_index()
+    combined, source = None, None
+    for run in sorted(dfs):                     # A..E = oldest..newest
+        df = dfs[run]
+        df = df[df.index >= coverage_start(run, df.index[0])]
+        src = pd.Series(run, index=df.index)
+        combined = df if combined is None else df.combine_first(combined)
+        source = src if source is None else src.combine_first(source)
+    combined = combined.drop(columns='run', errors='ignore')
+    newest_run, newest = max(dfs), dfs[max(dfs)]
+    if combined.index.max() >= coverage_start(newest_run, newest.index[0]):
+        _warn_gaps(dfs, source, combined)
+    return combined.assign(run=source)
+
+
+def _warn_gaps(dfs, source: pd.Series, combined: pd.DataFrame) -> None:
+    """Warn where an MTU came from an older run than the schedule says."""
+    scheduled = pd.Series(
+        [max(r for r, df in dfs.items() if coverage_start(r, df.index[0]) <= t) for t in source.index],
+        index=source.index,
+    )
+    stale = source[source != scheduled]
+    if len(stale):
+        warnings.warn(f'latest: {len(stale)} MTU(s) taken from an older run because the newer '
+                      f'one has no data, first {stale.index[0]:%H:%M}', stacklevel=3)
+    for run, df in dfs.items():
+        gone = combined.columns.difference(df.columns).difference(['run'])
+        if len(gone):
+            warnings.warn(f'latest: IDCC({run.lower()}) has no column(s) {", ".join(gone)}; '
+                          f'older runs fill in', stacklevel=3)
 
 
 def select(dfs: dict[str, pd.DataFrame], run: str) -> pd.DataFrame:
@@ -157,23 +204,25 @@ def select(dfs: dict[str, pd.DataFrame], run: str) -> pd.DataFrame:
     return dfs[run]
 
 
+def _file(folder, run: str, day, tz: str) -> Path:
+    return Path(folder) / f'IDCC{run.upper()}_{_delivery_day(day, tz).date()}.csv'
+
+
 def save(dfs: dict[str, pd.DataFrame], day=None, folder: str | Path = 'data', tz: str = TZ) -> list[Path]:
-    """Save each run as data/IDCC{run}_{YYYY-MM-DD}.csv."""
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    d = _delivery_day(day, tz).date()
+    """Save each entry as data/IDCC{RUN}_{YYYY-MM-DD}.csv (also works for 'latest')."""
+    day = _delivery_day(day, tz)
+    Path(folder).mkdir(parents=True, exist_ok=True)
     paths = []
     for run, df in dfs.items():
-        p = folder / f'IDCC{run}_{d}.csv'
+        p = _file(folder, run, day, tz)
         df.to_csv(p)
         paths.append(p)
     return paths
 
 
 def load(run: str, day=None, folder: str | Path = 'data', tz: str = TZ) -> pd.DataFrame:
-    """Load a run previously saved with save()."""
-    d = _delivery_day(day, tz).date()
-    df = pd.read_csv(Path(folder) / f'IDCC{run.upper()}_{d}.csv', index_col='mtu')
+    """Load a run (or 'latest') previously saved with save()."""
+    df = pd.read_csv(_file(folder, run, day, tz), index_col='mtu')
     df.index = pd.to_datetime(df.index, utc=True).tz_convert(tz)
     return df
 
@@ -184,8 +233,9 @@ def main(argv=None) -> None:
     p.add_argument('--runs', default=''.join(RUNS), help='Runs to fetch, e.g. ABCDE or D')
     p.add_argument('--out', default='data', help='Output folder (default: data/)')
     a = p.parse_args(argv)
-    dfs = fetch_all(a.day, runs=a.runs)
-    for path in save(dfs, a.day, a.out):
+    day = _delivery_day(a.day)
+    dfs = fetch_all(day, runs=a.runs)
+    for path in save(dfs, day, a.out):
         print(f'saved {path}')
 
 
