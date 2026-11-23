@@ -100,7 +100,10 @@ CZ → AT → HU    CZ>AT = 400, AT>HU = 200    → 200
 The result always equals the weakest set of borders separating X from Y
 (here CZ>SK + AT>HU = 500), which is a handy way to check a number.
 
-**Hourly** capacity is the minimum of the four 15-min capacities in that hour.
+**Hourly** capacity is the minimum of the four 15-min max-flows in that hour.
+Each quarter-hour is calculated on its own ATCs, so the route may differ between
+quarter-hours. This is not the same as one max-flow on per-border hourly minimum
+ATCs, which assumes the same flow all hour and gives equal or lower values.
 
 ### Limitations
 
