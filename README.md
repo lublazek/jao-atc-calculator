@@ -100,7 +100,33 @@ CZ → AT → HU    CZ>AT = 400, AT>HU = 200    → 200
 The result always equals the weakest set of borders separating X from Y
 (here CZ>SK + AT>HU = 500), which is a handy way to check a number.
 
-**Hourly** capacity is the minimum of the four 15-min capacities in that hour.
+### Hourly capacity
+
+The hourly capacity is calculated in two steps:
+
+1. max-flow for each of the four quarter-hours separately, on that quarter-hour's ATCs,
+2. hourly value = the **minimum of these four results**.
+
+```
+F_hour(X, Y) = min over the 4 quarter-hours τ of  F_τ(X, Y)
+```
+
+The route may differ between quarter-hours: each quarter-hour uses whichever
+borders are free at that moment. The hourly value can be delivered in every
+quarter-hour of the hour, because it is never above any of them.
+
+This is **not** the same as taking the minimum ATC of each border over the hour
+and running one max-flow on those. That approach assumes the same flow on every
+border for the whole hour and combines minima from different quarter-hours,
+which never occur together. It therefore gives values equal to or lower than
+ours.
+
+Example, SK→DE, hour 13:00:
+
+| | 13:00 | 13:15 | 13:30 | 13:45 | hour |
+|---|---|---|---|---|---|
+| max-flow per quarter-hour | 676 | 682 | 722 | 666 | **666** (this model) |
+| max-flow on per-border hourly minima | | | | | 529 |
 
 ### Limitations
 
